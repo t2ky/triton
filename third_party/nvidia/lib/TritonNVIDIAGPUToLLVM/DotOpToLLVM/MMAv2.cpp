@@ -521,21 +521,23 @@ static void callMmaTuringInt8(PTXBuilder &builder, int b,
                               const BaseOffset &base,
                               mlir::triton::PTXInstr &mma, unsigned numMmaRets,
                               unsigned colsPerThread, int numCPackedElem,
-                              ValueTableV2 &ha, ValueTableV2 &hb,
-                              const SmallVector<Value> &fc) {
+                              unsigned batchOffset, ValueTableV2 &ha,
+                              ValueTableV2 &hb, const SmallVector<Value> &fc) {
   auto retArgs1 = builder.newListOperand(numMmaRets / 2, "=r");
   auto retArgs2 = builder.newListOperand(numMmaRets / 2, "=r");
   auto cArgs1 = builder.newListOperand();
   for (int i = 0; i < numMmaRets / 2; ++i) {
     cArgs1->listAppend(builder.newOperand(
-        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i],
+        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i +
+           batchOffset * b],
         std::to_string(i)));
     // reuse the output registers
   }
   auto cArgs2 = builder.newListOperand();
   for (int i = numMmaRets / 2; i < numMmaRets; ++i) {
     cArgs2->listAppend(builder.newOperand(
-        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i],
+        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i +
+           batchOffset * b],
         std::to_string(i)));
     // reuse the output registers
   }
@@ -569,13 +571,15 @@ static void callMmaTuringFp16(PTXBuilder &builder, int b,
                               const BaseOffset &base,
                               mlir::triton::PTXInstr &mma, unsigned numMmaRets,
                               unsigned colsPerThread, int numCPackedElem,
-                              ValueTableV2 &ha, ValueTableV2 &hb,
-                              const SmallVector<Value> &fc, bool isAccF16) {
+                              unsigned batchOffset, ValueTableV2 &ha,
+                              ValueTableV2 &hb, const SmallVector<Value> &fc,
+                              bool isAccF16) {
   auto retArgs = builder.newListOperand(numMmaRets, isAccF16 ? "=r" : "=f");
   auto cArgs = builder.newListOperand();
   for (int i = 0; i < numMmaRets; ++i) {
     cArgs->listAppend(builder.newOperand(
-        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i],
+        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i +
+           batchOffset * b],
         std::to_string(i)));
     // reuse the output registers
   }
@@ -870,13 +874,12 @@ LogicalResult convertMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
     bool isFp64MMA = dTy.getElementType().isF64();
     BaseOffset base{numRegisters.m * m, numRegisters.n * n, numRegisters.k * k};
     if (isTuring) {
-      assert(b == 0 && "Turing only supports batch size 1");
       if (isIntMMA)
         callMmaTuringInt8(builder, b, base, mma, numMmaRets, colsPerThread,
-                          numCPackedElem, ha, hb, fc);
+                          numCPackedElem, batchOffset, ha, hb, fc);
       else
         callMmaTuringFp16(builder, b, base, mma, numMmaRets, colsPerThread,
-                          numCPackedElem, ha, hb, fc, isAccF16);
+                          numCPackedElem, batchOffset, ha, hb, fc, isAccF16);
     } else {
       if (isFp64MMA) {
         if (!isHopperF64) {

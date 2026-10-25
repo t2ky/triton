@@ -371,7 +371,7 @@ public:
                   mlir::PatternRewriter &rewriter) const override {
     if (computeCapability < 70)
       return failure();
-    if (computeCapability < 80) {
+    if (computeCapability < 75) {
       dotOp.emitRemark()
           << "Dot op using MMA for compute capability " << computeCapability
           << " has been deprecated. It falls back to the FMA path.";
@@ -388,6 +388,15 @@ public:
     auto oldAType = cast<RankedTensorType>(a.getType());
     auto oldBType = cast<RankedTensorType>(b.getType());
     auto oldRetType = cast<RankedTensorType>(dotOp.getType());
+
+    // Only F16 MMA on SM75
+    if ((!oldAType.getElementType().isF16() ||
+         !oldBType.getElementType().isF16() ||
+         (!oldRetType.getElementType().isF16() &&
+          !oldRetType.getElementType().isF32())) &&
+        computeCapability == 75) {
+      return failure();
+    }
 
     // Enable F64 MMA only on SM80/SM90 with high performance F64 tensorcore.
     // Otherwise, fallback to F64 FMA for better performance.
