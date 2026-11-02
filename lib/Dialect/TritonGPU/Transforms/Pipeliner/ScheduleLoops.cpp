@@ -219,8 +219,12 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
+  // Turing（レジスタ経由）では順に並べる: 次の周の tt.load（ld.global）→ 今の周の dot → local_store。
+  // ld.global を dot の前に出して待ちを計算の裏に隠し、共有メモリへの書き込みは計算の後に回す
+  bool regStaged = useRegisterStagedLoads(forOp);
   for (auto [op, stage] : opToStage)
-    schedule.insert(op, stage, clusters[maxStage - stage]);
+    schedule.insert(op, stage,
+                    clusters[regStaged ? stage : maxStage - stage]);
 
   // Move `scf.if` ops in the current schedule (forward slice of the latency
   // ops) into a new epilogue cluster at the end of the schedule, pushing them

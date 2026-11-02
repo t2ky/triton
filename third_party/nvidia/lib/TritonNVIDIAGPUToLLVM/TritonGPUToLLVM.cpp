@@ -267,6 +267,18 @@ bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,
       isa<ttng::WaitBarrierOp>(after))
     return true;
 
+  // Turing（cp.async 無し）のレジスタ経由のパイプライン（LowerLoops の createRegStagedCopy）:
+  // 周 k の local_load（面 k）→ local_store（面 k+1）の読みの後の書きは、面が 2 以上なので別の面。
+  // 面 k+1 を最後に読んだのは周 k-1 の local_load で、それと周 k の書きの間には、周 k の最初の
+  // 「local_store（周 k-1）→ local_load（周 k）」の同期が必ず入る。面の番号が実行時に決まるので
+  // membar は確保全体として見て同期を入れてしまう → この組だけ省く（書いた後の読み・書いた後の書きは残す）
+  if (auto ld = dyn_cast<mlir::triton::gpu::LocalLoadOp>(before))
+    if (auto st = dyn_cast<mlir::triton::gpu::LocalStoreOp>(after))
+      if (st->hasAttr("ttg.reg_staged") &&
+          allocation->getBufferIds(ld.getSrc()) ==
+              allocation->getBufferIds(st.getDst()))
+        return true;
+
   return false;
 }
 

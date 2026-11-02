@@ -77,5 +77,40 @@ About 20 minutes on 16 cores; the LLVM build is downloaded prebuilt.
 ## Limitations
 
 - Only fp16 operands use MMA on sm_75. bf16 has no tensor-core support on Turing; int8 and fp8 keep the FMA path.
-- Turing has no `cp.async`, so software pipelining (`num_stages > 1`) does not overlap loads the way it does on sm_80+.
+- Turing has no `cp.async`, so by default software pipelining (`num_stages > 1`) is skipped on sm_75. See the
+  experimental register-staged pipeline below.
 - Not covered by upstream CI. Run your own correctness checks (the numbers above came from comparing against `torch.matmul` and against a reference GPU).
+
+## Experimental: register-staged software pipelining on sm_75 (`TRITON_TURING_PIPELINE=1`, off by default)
+
+Upstream runs the pipeliner (`assign_latencies` / `schedule_loops` / `pipeline`) only on sm_8x/9x because it
+relies on `cp.async`. This branch adds an opt-in path for sm_75 that stages loads through registers, the same
+shape CUTLASS uses on sm75:
+
+```
+[tt.load of iteration k+1 -> registers] [local_load buffer k + dot] [local_store registers -> buffer k+1]
+```
+
+- `TRITON_TURING_PIPELINE=1` enables the pipeliner passes on sm_7x (`hopper_warpspec` stays sm_80+ only).
+  `TRITON_NV_REG_PIPELINE=1` forces the same register-staged lowering on sm_80+ (for development on newer GPUs).
+  Both are in `CACHE_INVALIDATING_ENV_VARS`, so switching them recompiles instead of reusing cached kernels.
+- `LowerLoops`: `createRegStagedCopy` keeps the `tt.load`, replaces its users with `local_load` of the current
+  buffer and stores into the next buffer in the last cluster (2+ buffers). A "producer staging" variant handles
+  `tt.load -> pure compute (e.g. int4 -> fp16 dequant) -> local_alloc -> dot` by moving the compute next to the
+  store, so dequantized weights do not take an extra round trip through shared memory.
+- `Prefetch`: loops built this way carry "the buffer to read this iteration" as an iter_arg, so the existing
+  prefetch pass splits the dot along k and loads the first k-slice of the next iteration early.
+- `TritonGPUToLLVM`: skips the read-after-write barrier between the staged `local_load` (buffer k) and
+  `local_store` (buffer k+1), which are always different buffers. One `__syncthreads` per iteration remains.
+- Loops with two or more dots (attention) and loops that cannot use register staging are left unpipelined on
+  sm_75 (pipelining them would emit `cp.async`). Attention got slower with pipelining in our tests.
+
+Measured on RTX 2080 (fp16 GEMM, M=2048, TFLOP/s; cuBLAS 53-61): best tiles without pipelining reach
+about 44-51; with this path, e.g. a 3840x15360 GEMM goes 44.7 -> 52.4 (128x128x32, 4 warps, 2 stages).
+For a dense fp16 layer stack (qkv + o + gate_up + down) the total time drops 12-15% at M=1024-2048.
+4-bit weight GEMMs (dequant in the loop) gain 18-40% over the same tile without pipelining but do not
+beat Marlin. Correctness: `python/test/unit/language/test_core.py` with `TRITON_NV_REG_PIPELINE=1` on an
+RTX 3090 shows no numerical failures (3 failures: two tests that assert `cp.async` waits are emitted and one
+shared-memory-size failure that also happens without the flag).
+
+Gains are kernel-dependent and end-to-end serving gains were small in our tests, so this stays opt-in.

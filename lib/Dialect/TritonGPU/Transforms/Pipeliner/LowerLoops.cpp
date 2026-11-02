@@ -1,5 +1,8 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -203,6 +206,123 @@ void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   loadOp->erase();
 }
 
+// Turing（sm_75 など cp.async の無い NVIDIA）向けのレジスタ経由の copy。CUTLASS の sm75 と同じ形:
+//   [tt.load 周 k+1 → レジスタ] [local_load 面 k ＋ dot] [local_store レジスタ → 面 k+1]
+// ld.global を dot の前に出して待ちを計算の裏に隠し、st.shared は計算の後に回す。面は 2 以上
+// （ScheduleLoops が stage の順に cluster を並べ、local_store は最後尾の cluster に置く）。
+// tt.load は消さずに残す（mask と other もそのまま効くので select は要らない）
+void createRegStagedCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
+                         Value insertIdx, Value extractIdx,
+                         CoarseSchedule &schedule,
+                         CoarseSchedule::Cluster storeCluster) {
+  OpBuilderForStage builder(loadOp.getLoc(), forOp, schedule);
+  Operation *firstUse = getFirstUseOfPipelinedOp({loadOp}, forOp, schedule);
+  assert(firstUse && "LoadOp has no users");
+  OpBuilder::InsertionGuard guard(builder);
+  int loadStage = schedule[loadOp].first;
+
+  // (1) 先に使い手を local_load（面 extractIdx）に置き換える。local_store を作る前でないと、
+  //     replaceAllUsesWith が local_store の operand まで置き換えてしまう
+  builder.setInsertionPoint(firstUse);
+  builder.setStageCluster(schedule[firstUse]);
+  auto viewLoad = createSingleBufferView(builder, alloc, extractIdx);
+  replaceUsesWithLocalLoad(builder, loadOp->getResult(0), viewLoad);
+
+  // (2) 読んだ値を、load と同じ stage・最後尾の cluster で面 insertIdx に書く
+  builder.setInsertionPoint(forOp.getBody()->getTerminator());
+  builder.setStageCluster({loadStage, storeCluster});
+  auto viewStore = createSingleBufferView(builder, alloc, insertIdx);
+  auto store = ttg::LocalStoreOp::create(builder, loadOp.getResult(), viewStore);
+  store->setAttr("ttg.reg_staged", builder.getUnitAttr());
+}
+
+// local_alloc(V) の V をループの本体の中で作る op を、順に並べて返す（ループの外の値で止める）
+static SmallVector<Operation *> producerSlice(scf::ForOp forOp, Value v) {
+  SetVector<Operation *> slice;
+  BackwardSliceOptions opt;
+  opt.filter = [&](Operation *op) { return op->getBlock() == forOp.getBody(); };
+  if (Operation *def = v.getDefiningOp()) {
+    if (def->getBlock() != forOp.getBody())
+      return {};
+    (void)getBackwardSlice(def, &slice, opt);
+    slice.insert(def);
+  }
+  auto sorted = mlir::topologicalSort(slice);
+  return SmallVector<Operation *>(sorted.begin(), sorted.end());
+}
+
+// Turing 向け: 「tt.load → 純粋な計算 → V → local_alloc(V) → (memdesc_trans) → local_load → dot」の local_alloc か。
+// 当てはまれば V を作るのに使う tt.load を loads に入れる
+static bool isProducerStagedAlloc(scf::ForOp forOp, ttg::LocalAllocOp alloc,
+                                  SmallVectorImpl<Operation *> &loads) {
+  if (!alloc.getSrc() || alloc->getBlock() != forOp.getBody())
+    return false;
+  if (!isa<ttg::SharedEncodingTrait>(alloc.getType().getEncoding()))
+    return false;
+  Value v = alloc.getSrc();
+  if (v.getDefiningOp<tt::LoadOp>())
+    return false; // 読んだ値をそのまま置くものは通常の経路で扱う
+  auto slice = producerSlice(forOp, v);
+  if (slice.empty())
+    return false;
+  for (Operation *op : slice) {
+    if (isa<tt::LoadOp>(op)) {
+      loads.push_back(op);
+      continue;
+    }
+    if (!isPure(op) || op->getNumRegions() != 0)
+      return false;
+  }
+  if (loads.empty())
+    return false;
+  // 使い手は（memdesc_trans を経て）dot の operand の local_load だけ
+  SmallVector<Operation *> users(alloc->getUsers().begin(), alloc->getUsers().end());
+  while (!users.empty()) {
+    Operation *u = users.pop_back_val();
+    if (auto tr = dyn_cast<ttg::MemDescTransOp>(u)) {
+      users.append(tr->getUsers().begin(), tr->getUsers().end());
+      continue;
+    }
+    auto ld = dyn_cast<ttg::LocalLoadOp>(u);
+    if (!ld || !isa<ttg::DotOperandEncodingAttr>(ld.getType().getEncoding()))
+      return false;
+  }
+  return true;
+}
+
+// local_alloc(V) を 2 面のバッファに置き換える: 使い手には面 extractIdx を渡し、V を作る計算（tt.load 以外）は
+// load と同じ段の最後尾の cluster に移して、そこで面 insertIdx に local_store する。
+// 1 周の並び: [tt.load 周 k+1] [local_load 面 k ＋ dot] [V を作る計算 周 k+1 ＋ local_store 面 k+1]
+void createProducerStagedCopy(scf::ForOp forOp, ttg::LocalAllocOp allocOp,
+                              Value alloc, Value insertIdx, Value extractIdx,
+                              CoarseSchedule &schedule,
+                              CoarseSchedule::Cluster storeCluster) {
+  OpBuilderForStage builder(allocOp.getLoc(), forOp, schedule);
+  OpBuilder::InsertionGuard guard(builder);
+  Value v = allocOp.getSrc();
+  auto slice = producerSlice(forOp, v);
+  int loadStage = INT_MAX;
+  for (Operation *op : slice)
+    if (isa<tt::LoadOp>(op))
+      loadStage = std::min(loadStage, schedule[op].first);
+  for (Operation *op : slice)
+    if (!isa<tt::LoadOp>(op))
+      schedule.insert(op, loadStage, storeCluster);
+  // 使い手へは面 extractIdx（local_alloc と同じ段・cluster で）
+  builder.setInsertionPoint(allocOp);
+  builder.setStageCluster(schedule[allocOp]);
+  auto viewLoad = createSingleBufferView(builder, alloc, extractIdx);
+  replaceUsesAndPropagateType(builder, allocOp, viewLoad);
+  // V を面 insertIdx に書く
+  builder.setInsertionPoint(forOp.getBody()->getTerminator());
+  builder.setStageCluster({loadStage, storeCluster});
+  auto viewStore = createSingleBufferView(builder, alloc, insertIdx);
+  auto store = ttg::LocalStoreOp::create(builder, v, viewStore);
+  store->setAttr("ttg.reg_staged", builder.getUnitAttr());
+  schedule.erase(allocOp);
+  allocOp->erase();
+}
+
 void createTMAAsyncCopy(
     scf::ForOp forOp, Operation *loadOp, Value desc, Value alloc,
     Value insertIdx, Value extractIdx, Value barrier, Operation *waitOp,
@@ -268,6 +388,11 @@ void createTMAAsyncGather(scf::ForOp forOp, tt::DescriptorGatherOp gatherOp,
 
 struct AsyncLoad {
   int stageDiff;
+  // Turing（cp.async 無し）用: tt.load を残してレジスタへ読み、計算の後で次の面へ local_store する
+  bool regStaged = false;
+  // Turing 用: tt.load から純粋な計算で作った値（4 ビットの重みを fp16 に戻したものなど）の local_alloc を
+  // 多面バッファに置き換える（キーは local_alloc の op）。戻す計算は load と同じ段の最後尾に移す
+  bool producerStaged = false;
   int contiguity = 1;
   Value alloc;
   Value barrier;
@@ -442,9 +567,23 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   llvm::MapVector<Operation *, AsyncLoad> asyncLoads;
   llvm::MapVector<int, LoadGroupInfo> loadGroups;
   llvm::SmallVector<Operation *> scalarLoads;
+  bool regMode = useRegisterStagedLoads(forOp);
+  SmallVector<ttg::LocalAllocOp> producerAllocs;
+  DenseSet<Operation *> producerLoads;
+  if (regMode) {
+    for (auto allocOp : forOp.getBody()->getOps<ttg::LocalAllocOp>()) {
+      SmallVector<Operation *> loads;
+      if (isProducerStagedAlloc(forOp, allocOp, loads)) {
+        producerAllocs.push_back(allocOp);
+        producerLoads.insert(loads.begin(), loads.end());
+      }
+    }
+  }
   // Only visit the top level ops, we do not support pipelining conditional
   // loads for now
   for (auto &op : forOp.getBody()->without_terminator()) {
+    if (producerLoads.contains(&op))
+      continue; // V を作る計算と一緒に load と同じ段へ移す（レジスタに読むだけ）
     if (isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
       int stageDiff = getDefUseStageDiff(&op, forOp, schedule);
       if (stageDiff == 0) {
@@ -461,6 +600,8 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         sharedEncoding = ttg::SwizzledSharedEncodingAttr::get(
             forOp.getContext(), 1, 1, 1, {0},
             ttg::CGAEncodingAttr::get1DLayout(forOp.getContext(), numCTAs));
+        if (regMode)
+          canUseAsyncCp = false; // Turing: スカラーの load はパイプラインに乗せない
         if (canUseAsyncCp) {
           scalarLoads.push_back(&op);
         }
@@ -485,7 +626,17 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
           contiguity = vec;
         }
       }
-      if (canUseAsyncCp || isTMALoad(&op)) {
+      // Turing（cp.async 無し）: tensor の tt.load はレジスタ経由で多面バッファに置く
+      bool regStaged = regMode && isa<tt::LoadOp>(op) &&
+                       isa<RankedTensorType>(op.getResultTypes()[0]);
+      if (regMode)
+        canUseAsyncCp = false;
+      if (regStaged) {
+        auto &asyncLoad = asyncLoads[&op];
+        asyncLoad.stageDiff = std::max(stageDiff, 2);
+        asyncLoad.regStaged = true;
+        asyncLoad.sharedEncoding = sharedEncoding;
+      } else if (canUseAsyncCp || isTMALoad(&op)) {
         if (loadRequiresAdditionalBuffer(&op)) {
           // Allocate additional buffer required by the wgmma pipelining.
           stageDiff += 1;
@@ -507,6 +658,15 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     }
   }
 
+  for (auto allocOp : producerAllocs) {
+    auto &asyncLoad = asyncLoads[allocOp.getOperation()];
+    asyncLoad.stageDiff = 2;
+    asyncLoad.regStaged = true;
+    asyncLoad.producerStaged = true;
+    asyncLoad.sharedEncoding =
+        cast<ttg::SharedEncodingTrait>(allocOp.getType().getEncoding());
+  }
+
   // Convert scalar loads to be able to use async copy.
   for (auto op : scalarLoads) {
     convertScalarToTensorLoad(op, schedule, forOp);
@@ -516,8 +676,14 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     return forOp;
 
   for (auto &[loadOp, asyncLoad] : asyncLoads) {
-    Value alloc = createAlloc(forOp, loadOp, asyncLoad.sharedEncoding,
-                              asyncLoad.stageDiff);
+    Value alloc =
+        asyncLoad.producerStaged
+            ? triton::createAlloc(
+                  forOp, cast<RankedTensorType>(loadOp->getOperand(0).getType()),
+                  loadOp->getLoc(), asyncLoad.sharedEncoding,
+                  asyncLoad.stageDiff)
+            : createAlloc(forOp, loadOp, asyncLoad.sharedEncoding,
+                          asyncLoad.stageDiff);
     asyncLoad.alloc = alloc;
     loadGroups.insert({asyncLoad.stageDiff, {}});
     if (isTMALoad(loadOp)) {
@@ -592,9 +758,21 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   createTMABarrierAndWait(forOp, asyncLoads, loadGroups, schedule);
 
   bool hasAsyncLoads = false;
+  std::optional<CoarseSchedule::Cluster> storeCluster;
   for (auto [op, asyncLoad] : asyncLoads) {
     auto [insertIdx, extractIdx, phase, _] = loadGroups[asyncLoad.stageDiff];
-    if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
+    if (asyncLoad.producerStaged) {
+      if (!storeCluster)
+        storeCluster = schedule.clusters.newAtBack();
+      createProducerStagedCopy(forOp, cast<ttg::LocalAllocOp>(op),
+                               asyncLoad.alloc, insertIdx, extractIdx, schedule,
+                               *storeCluster);
+    } else if (asyncLoad.regStaged) {
+      if (!storeCluster)
+        storeCluster = schedule.clusters.newAtBack();
+      createRegStagedCopy(forOp, cast<tt::LoadOp>(op), asyncLoad.alloc,
+                          insertIdx, extractIdx, schedule, *storeCluster);
+    } else if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
       createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
                       asyncLoad.contiguity, schedule);
       hasAsyncLoads = true;

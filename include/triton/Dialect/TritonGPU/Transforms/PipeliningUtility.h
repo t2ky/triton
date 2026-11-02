@@ -101,6 +101,14 @@ int getCopyVecBytes(RankedTensorType registerTy,
 bool canBeConvertedToAsyncLoad(
     triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
 
+// Turing（sm_75 など cp.async の無い NVIDIA）向けに、cp.async の代わりに「tt.load でレジスタへ読む →
+// 計算 → local_store で次の面へ書く」形でパイプラインを組むか。sm < 80 か、TRITON_NV_REG_PIPELINE=1
+// （sm80 以上で同じ経路を試す用）のとき真。target の属性が cuda でなければ偽
+bool useRegisterStagedLoads(Operation *op);
+
+// cp.async の無い NVIDIA（sm < 80）か。これが真でレジスタ経由も使わないループは、パイプラインを掛けない
+bool isNvidiaWithoutAsyncCopy(Operation *op);
+
 // Serialize the latencies of the operations in the loops into the latency
 // attribute.
 void serializeLatencies(ModuleOp module, DenseMap<Operation *, int> &opLatency);

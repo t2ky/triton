@@ -16,6 +16,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <queue>
@@ -375,6 +376,40 @@ int mlir::triton::getCopyVecBytes(RankedTensorType registerTy,
   auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
   const int vecElems = regToSharedLayout.getNumConsecutiveInOut();
   return vecElems * registerTy.getElementTypeBitWidth() / 8;
+}
+
+bool mlir::triton::isNvidiaWithoutAsyncCopy(Operation *op) {
+  auto mod = isa<ModuleOp>(op) ? cast<ModuleOp>(op)
+                               : op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return false;
+  auto target = mod->getAttrOfType<StringAttr>(ttg::AttrTargetName);
+  if (!target || !target.strref().starts_with("cuda:"))
+    return false;
+  return mlir::getNVIDIAComputeCapability(mod) < 80;
+}
+
+bool mlir::triton::useRegisterStagedLoads(Operation *op) {
+  auto mod = isa<ModuleOp>(op) ? cast<ModuleOp>(op)
+                               : op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return false;
+  auto target = mod->getAttrOfType<StringAttr>(ttg::AttrTargetName);
+  if (!target || !target.strref().starts_with("cuda:"))
+    return false;
+  if (!(mlir::getNVIDIAComputeCapability(mod) < 80 ||
+        tools::getBoolEnv("TRITON_NV_REG_PIPELINE")))
+    return false;
+  // dot が 2 つ以上あるループ（attention など）は対象外。vLLM の TRITON_ATTN で全体が遅くなった
+  // （2080、同時 16 本 5.29 → 7.63 秒、2026-10-31）。ループ以外から呼ばれたときは判定しない
+  if (auto forOp = isa<scf::ForOp>(op) ? cast<scf::ForOp>(op)
+                                       : op->getParentOfType<scf::ForOp>()) {
+    int numDots = 0;
+    forOp.getBody()->walk([&](tt::DotOp) { ++numDots; });
+    if (numDots > 1)
+      return false;
+  }
+  return true;
 }
 
 bool mlir::triton::canBeConvertedToAsyncLoad(

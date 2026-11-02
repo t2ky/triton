@@ -63,6 +63,9 @@ public:
       : forOp(forOp), numStages(numStages), opLatency(opLatency) {};
 
   void run() {
+    // Turing でレジスタ経由も使わないループ（dot が 2 つ以上など）は掛けない（cp.async が出て落ちる）
+    if (isNvidiaWithoutAsyncCopy(forOp) && !useRegisterStagedLoads(forOp))
+      return;
     bool pipelineWithoutDot = forOp->hasAttr(mlir::triton::kNumStagesAttrName);
     ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
     tt::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
@@ -78,6 +81,9 @@ public:
     for (auto &[loadOp, info] : loadOpToIndLevel)
       maxIndirectionLevel = std::max(maxIndirectionLevel, info.first);
     unsigned loadLatency = (numStages - 1) / (maxIndirectionLevel + 1);
+    // Turing（レジスタ経由）では、読み込みは 1 周先だけ。段を増やしても面が増えるだけで待ちを隠せる幅は増えない
+    if (useRegisterStagedLoads(forOp))
+      loadLatency = std::min(loadLatency, 1u);
 
     for (auto [loadOp, dist] : loadOpToIndLevel) {
       opLatency[loadOp] = loadLatency;

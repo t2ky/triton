@@ -31,6 +31,10 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "tritongpu-prefetch"
@@ -150,6 +154,106 @@ Value Prefetcher::generatePrefetch(Value v, unsigned opIdx, bool isPrologue,
       RankedTensorType::get(shape, elementType, dotOperandEnc), newSmem);
 
   return prefetchSlice;
+}
+
+
+// Turing（cp.async 無し）のレジスタ経由のパイプライン（LowerLoops の createRegStagedCopy）で組んだループは、
+// dot の operand を `local_load(memdesc_index(確保, 番号))` で読み、番号はループの中で添字から計算する。
+// Prefetch はループで持ち回る共有メモリの値にしか効かないので、「この周に読む面」を持ち回る値に書き換える:
+//   ループの前で番号の計算を初期値で複製して最初の面を作り、ループの最後で次の周の値で複製して次の面を yield する。
+// 次の周に読む面は、この周の最後に local_store で書いた面なので、Prefetch が足す「次の周の最初の k の切れ」の
+// local_load の前に入る同期が、1 周あたりの唯一の同期になる。
+static scf::ForOp carryRegStagedViews(scf::ForOp forOp) {
+  bool hasRegStaged = false;
+  forOp.getBody()->walk([&](LocalStoreOp st) {
+    if (st->hasAttr("ttg.reg_staged"))
+      hasRegStaged = true;
+  });
+  if (!hasRegStaged)
+    return forOp;
+  SmallVector<triton::DotOp> dots;
+  for (Operation &op : forOp.getBody()->without_terminator())
+    if (auto d = dyn_cast<triton::DotOp>(op))
+      dots.push_back(d);
+  if (dots.size() != 1)
+    return forOp;
+  // dot の A・B の local_load と、その元の memdesc_index（ループの中で定義されたもの）
+  // 面は memdesc_index（4 ビットの重みを戻したものは、その後に memdesc_trans が挟まる）
+  SmallVector<std::pair<LocalLoadOp, Operation *>> targets;
+  for (Value operand : {dots[0].getA(), dots[0].getB()}) {
+    auto ld = operand.getDefiningOp<LocalLoadOp>();
+    if (!ld || !ld->hasOneUse() || ld.getToken())
+      return forOp;
+    Operation *view = ld.getSrc().getDefiningOp();
+    if (!view || !isa<MemDescIndexOp, MemDescTransOp>(view) ||
+        view->getBlock() != forOp.getBody() || !view->hasOneUse())
+      return forOp;
+    targets.push_back({ld, view});
+  }
+  // 番号の計算（ループの本体の中の op）を集める
+  auto sliceOf = [&](Operation *root) {
+    SetVector<Operation *> slice;
+    BackwardSliceOptions opt;
+    opt.filter = [&](Operation *op) { return op->getBlock() == forOp.getBody(); };
+    (void)getBackwardSlice(root, &slice, opt);
+    slice.insert(root);
+    return mlir::topologicalSort(slice);
+  };
+  for (auto &t : targets)
+    for (Operation *op : sliceOf(t.second))
+      if (!isPure(op) && !isa<MemDescIndexOp, MemDescTransOp>(op))
+        return forOp; // 副作用のある op には頼らない
+  auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  OpBuilder b(forOp);
+  // ループの前: 添字 → 初期値、誘導変数 → 下限
+  IRMapping initMap;
+  initMap.map(forOp.getInductionVar(), forOp.getLowerBound());
+  for (auto [arg, init] : llvm::zip(forOp.getRegionIterArgs(), forOp.getInitArgs()))
+    initMap.map(arg, init);
+  SmallVector<Value> initViews;
+  for (auto &t : targets) {
+    for (Operation *op : sliceOf(t.second))
+      if (!initMap.contains(op->getResult(0)))
+        b.clone(*op, initMap);
+    initViews.push_back(initMap.lookup(t.second->getResult(0)));
+  }
+  // ループの最後: 添字 → yield する値、誘導変数 → 誘導変数＋刻み
+  b.setInsertionPoint(yieldOp);
+  IRMapping nextMap;
+  Value nextIv = arith::AddIOp::create(b, forOp.getLoc(), forOp.getInductionVar(), forOp.getStep());
+  nextMap.map(forOp.getInductionVar(), nextIv);
+  for (auto [arg, y] : llvm::zip(forOp.getRegionIterArgs(), yieldOp.getOperands()))
+    nextMap.map(arg, y);
+  SmallVector<Value> nextViews;
+  for (auto &t : targets) {
+    for (Operation *op : sliceOf(t.second))
+      if (!nextMap.contains(op->getResult(0)))
+        b.clone(*op, nextMap);
+    nextViews.push_back(nextMap.lookup(t.second->getResult(0)));
+  }
+  unsigned oldNumArgs = forOp.getNumRegionIterArgs();
+  OpBuilder rb(forOp);
+  scf::ForOp newFor = addIterArgsToLoop(rb, forOp, initViews);
+  auto newYield = cast<scf::YieldOp>(newFor.getBody()->getTerminator());
+  for (Value v : nextViews)
+    newYield->insertOperands(newYield.getNumOperands(), v);
+  // local_load の元を持ち回る値に差し替える（元の memdesc_index は使い手が無くなる）
+  unsigned i = 0;
+  for (auto dot : newFor.getBody()->getOps<triton::DotOp>()) {
+    for (Value operand : {dot.getA(), dot.getB()}) {
+      auto ld = operand.getDefiningOp<LocalLoadOp>();
+      Operation *view = ld.getSrc().getDefiningOp();
+      ld.getSrcMutable().assign(newFor.getRegionIterArgs()[oldNumArgs + i]);
+      // 使い手の無くなった面の計算（memdesc_trans → memdesc_index）を消す
+      while (view && view->use_empty() && isa<MemDescIndexOp, MemDescTransOp>(view)) {
+        Operation *next = view->getOperand(0).getDefiningOp();
+        view->erase();
+        view = next;
+      }
+      ++i;
+    }
+  }
+  return newFor;
 }
 
 LogicalResult Prefetcher::initialize() {
@@ -434,6 +538,11 @@ struct PrefetchPass : public impl::TritonGPUPrefetchBase<PrefetchPass> {
             .failed()) {
       signalPassFailure();
     }
+    // Turing のレジスタ経由のパイプラインのループは、先に「読む面」を持ち回る値にする
+    SmallVector<scf::ForOp> loops;
+    getOperation()->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
+    for (scf::ForOp forOp : loops)
+      (void)carryRegStagedViews(forOp);
     getOperation()->walk([&](scf::ForOp forOp) {
       Prefetcher prefetcher(forOp);
 
